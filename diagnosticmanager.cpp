@@ -1,89 +1,222 @@
 #include "diagnosticmanager.h"
 #include <QDebug>
+#include <QRegularExpression>
 
 DiagnosticManager::DiagnosticManager(QObject *parent) 
-    : QObject(parent), process(new QProcess(this)), currentProgress(0), overallSuccess(true)
+    : QObject(parent), process(new QProcess(this)), currentStep(0), 
+      currentProgress(0), overallSuccess(true)
 {
-    // Настройка процесса
-    process->setProcessChannelMode(QProcess::MergedChannels);
+    connect(process, &QProcess::readyReadStandardOutput,
+            this, [this]() {
+                QString output = process->readAllStandardOutput();
+                emit progressUpdated(currentProgress, output);
+                
+                switch (currentStep) {
+                    case 0: // Battery
+                        parseBatteryInfo(output);
+                        break;
+                    case 1: // Disk
+                        parseDiskInfo(output);
+                        break;
+                    case 2: // Apple ID
+                        parseAppleIDInfo(output);
+                        break;
+                }
+            });
+
+    connect(process, &QProcess::finished,
+            this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                if (exitCode != 0 || exitStatus != QProcess::NormalExit) {
+                    overallSuccess = false;
+                }
+                currentProgress += 25;
+                
+                switch (currentStep) {
+                    case 0:
+                        QTimer::singleShot(0, this, &DiagnosticManager::checkDiskHealth);
+                        break;
+                    case 1:
+                        QTimer::singleShot(0, this, &DiagnosticManager::checkAppleID);
+                        break;
+                    case 2:
+                        QTimer::singleShot(0, this, &DiagnosticManager::checkSystemIntegrity);
+                        break;
+                    case 3:
+                        // Добавляем рекомендации перед завершением
+                        if (results.hasAppleID) {
+                            results.recommendations.append("Выйдите из Apple ID перед передачей устройства");
+                        }
+                        if (results.maxCapacity < 80) {
+                            results.recommendations.append("Рекомендуется заменить батарею (ёмкость менее 80%)");
+                        }
+                        emit diagnosticsFinished(overallSuccess, results);
+                        break;
+                }
+                currentStep++;
+            });
 }
 
 void DiagnosticManager::runDiagnostics()
 {
-    // Сброс состояния
+    currentStep = 0;
     currentProgress = 0;
     overallSuccess = true;
+    results = DiagnosticResults();
 
-    // Последовательность диагностических проверок
     QTimer::singleShot(0, this, &DiagnosticManager::checkBattery);
 }
 
 void DiagnosticManager::checkBattery()
 {
     executeSystemCommand(
-        "system_profiler SPPowerDataType", 
-        "🔋 Проверка состояния батареи..."
+        "/usr/sbin/system_profiler",
+        QStringList() << "SPPowerDataType",
+        " Проверка состояния батареи..."
     );
 }
 
 void DiagnosticManager::checkDiskHealth()
 {
     executeSystemCommand(
-        "diskutil list", 
-        "💽 Проверка состояния дисков..."
+        "diskutil verifyVolume /",
+        " Проверка состояния дисков..."
     );
 }
 
-void DiagnosticManager::checkAppleIDStatus()
+void DiagnosticManager::checkAppleID()
 {
     executeSystemCommand(
-        "dscl . -list /Users", 
-        "🍎 Проверка статуса Apple ID..."
+        "defaults read MobileMeAccounts",
+        " Проверка статуса Apple ID..."
     );
 }
 
 void DiagnosticManager::checkSystemIntegrity()
 {
-    executeSystemCommand(
-        "diskutil verifyVolume /", 
-        "🛡️ Проверка целостности системы..."
-    );
+    results.diskCheckPassed = overallSuccess;
+    emit diagnosticsFinished(overallSuccess, results);
+}
+
+void DiagnosticManager::executeSystemCommand(const QString &command, const QStringList &args, const QString &description)
+{
+    emit progressUpdated(currentProgress, description);
+    qDebug() << "Executing command:" << command << args.join(" ");
+    
+    process->start(command, args);
+    if (!process->waitForStarted()) {
+        emit progressUpdated(currentProgress, " Ошибка запуска команды: " + command);
+        overallSuccess = false;
+        emit diagnosticsFinished(false, results);
+        return;
+    }
 }
 
 void DiagnosticManager::executeSystemCommand(const QString &command, const QString &description)
 {
-    // Обновление прогресса
-    currentProgress += 25;
-    emit progressUpdated(currentProgress, description);
-
-    // Выполнение системной команды
-    process->start("bash", QStringList() << "-c" << command);
+    QStringList args = command.split(' ');
+    QString program = args.takeFirst();
     
-    // Ожидание завершения
-    if (!process->waitForFinished(10000)) {
-        // Обработка таймаута
-        emit progressUpdated(currentProgress, "❌ Превышено время ожидания команды");
-        overallSuccess = false;
-        return;
+    executeSystemCommand(program, args, description);
+}
+
+void DiagnosticManager::parseBatteryInfo(const QString &output)
+{
+    // Ищем цикл зарядки
+    QRegularExpression cycleCountRegex("Cycle Count:\\s*(\\d+)");
+    auto cycleMatch = cycleCountRegex.match(output);
+    if (cycleMatch.hasMatch()) {
+        results.cycleCounts = cycleMatch.captured(1).toInt();
     }
-
-    // Чтение результата
-    QString output = QString::fromUtf8(process->readAllStandardOutput());
-    emit progressUpdated(currentProgress, output);
-
-    // Проверка статуса
-    if (process->exitCode() != 0) {
-        overallSuccess = false;
+    
+    // Ищем максимальную ёмкость, просто находя нужную строку
+    QStringList lines = output.split('\n');
+    for (const QString &line : lines) {
+        if (line.contains("Maximum Capacity:")) {
+            // Извлекаем число перед символом %
+            QString trimmed = line.trimmed();
+            int percentIndex = trimmed.indexOf('%');
+            if (percentIndex > 0) {
+                QString numberStr = trimmed.mid(trimmed.lastIndexOf(' '), percentIndex - trimmed.lastIndexOf(' ')).trimmed();
+                results.maxCapacity = numberStr.toInt();
+                break;
+            }
+        }
     }
+}
 
-    // Переход к следующей проверке
-    if (currentProgress == 25) {
-        QTimer::singleShot(0, this, &DiagnosticManager::checkDiskHealth);
-    } else if (currentProgress == 50) {
-        QTimer::singleShot(0, this, &DiagnosticManager::checkAppleIDStatus);
-    } else if (currentProgress == 75) {
-        QTimer::singleShot(0, this, &DiagnosticManager::checkSystemIntegrity);
-    } else if (currentProgress == 100) {
-        emit diagnosticsFinished(overallSuccess);
+void DiagnosticManager::parseAppleIDInfo(const QString &output)
+{
+    qDebug() << "\n=== Parsing Apple ID Info ===";
+    qDebug() << "Raw output:";
+    qDebug() << output;
+    
+    if (output.contains("AccountID") || output.contains("AppleID")) {
+        results.hasAppleID = true;
+        
+        // Пытаемся найти email
+        QRegularExpression emailRegex("AccountID\\s*=\\s*\"([^\"]+)\"");
+        auto match = emailRegex.match(output);
+        if (match.hasMatch()) {
+            results.appleIDEmail = match.captured(1);
+            qDebug() << "Found Apple ID:" << results.appleIDEmail;
+        } else {
+            results.appleIDEmail = "Найден (email скрыт)";
+            qDebug() << "Apple ID found but hidden";
+        }
+        
+        // Проверяем статус Find My Mac
+        QStringList lines = output.split('\n');
+        bool isFindMyMacSection = false;
+        bool enabled = false;
+        
+        qDebug() << "\nSearching for Find My Mac status:";
+        for (const QString &line : lines) {
+            QString trimmedLine = line.trimmed();
+            qDebug() << "Checking line:" << trimmedLine;
+            
+            // Если нашли начало новой секции, сбрасываем флаг
+            if (trimmedLine.startsWith("{")) {
+                isFindMyMacSection = false;
+            }
+            
+            // Проверяем, является ли это секцией Find My Mac
+            if (trimmedLine.contains("Name = \"FIND_MY_MAC\"")) {
+                qDebug() << "Found Find My Mac section";
+                isFindMyMacSection = true;
+            }
+            
+            // Если мы в секции Find My Mac и нашли Enabled
+            if (isFindMyMacSection && trimmedLine.contains("Enabled =")) {
+                enabled = trimmedLine.contains("Enabled = 1");
+                qDebug() << "Found Enabled status:" << enabled;
+            }
+        }
+        
+        results.findMyMacEnabled = enabled;
+        qDebug() << "Final Find My Mac status:" << results.findMyMacEnabled;
+        
+    } else {
+        results.hasAppleID = false;
+        results.findMyMacEnabled = false;
+        qDebug() << "No Apple ID found";
+    }
+    
+    qDebug() << "\nFinal results:";
+    qDebug() << "Has Apple ID:" << results.hasAppleID;
+    qDebug() << "Apple ID Email:" << results.appleIDEmail;
+    qDebug() << "Find My Mac Enabled:" << results.findMyMacEnabled;
+    qDebug() << "=========================\n";
+}
+
+void DiagnosticManager::parseDiskInfo(const QString &output)
+{
+    results.diskCheckPassed = output.contains("appears to be OK") || 
+                             output.contains("No problems found");
+    
+    if (!results.diskCheckPassed) {
+        results.diskStatus = output.split("\n").filter("Error").join(", ");
+        if (results.diskStatus.isEmpty()) {
+            results.diskStatus = "Неизвестная ошибка";
+        }
     }
 }

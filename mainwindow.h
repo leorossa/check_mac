@@ -2,10 +2,11 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
-#include <QTextEdit>
-#include <QPushButton>
 #include <QVBoxLayout>
-#include <QProgressBar>
+#include <QHBoxLayout>
+#include <QPushButton>
+#include <QTextEdit>
+#include <QProcess>
 #include "diagnosticmanager.h"
 
 class MainWindow : public QMainWindow
@@ -17,12 +18,24 @@ public:
 
 private slots:
     void startDiagnostics();
-    void updateDiagnosticProgress(int progress, const QString &message);
-    void diagnosticsCompleted(bool success);
+    void updateLog(const QString &message);
+    void diagnosticsCompleted(bool success, const DiagnosticResults &results);
+    void openAppleIDSettings();
+    void createAdminUser();
+    void createRegularUser();
 
 private:
-    QTextEdit *logDisplay;
+    void createUser(const QString &username, const QString &password, bool isAdmin);
+    void executeCommand(const QString &command, const QStringList &args);
+
     QPushButton *startButton;
-    QProgressBar *progressBar;
+    QPushButton *settingsButton;
+    QPushButton *createAdminButton;
+    QPushButton *createUserButton;
+    QTextEdit *logOutput;
+    QProcess *process;
     DiagnosticManager *diagnosticManager;
+    bool userExists;  // Флаг для отслеживания существующего пользователя
 };
+
+#endif // MAINWINDOW_H
